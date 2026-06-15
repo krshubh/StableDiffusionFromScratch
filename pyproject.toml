@@ -1,0 +1,19 @@
+[project]
+name = "stablediffusionfromscratch"
+version = "0.1.0"
+description = "A diffusion model built from scratch using PyTorch on CIFAR-10 with text conditioning"
+readme = "README.md"
+requires-python = ">=3.13"
+dependencies = [
+    "numpy>=1.21.0",
+    "matplotlib>=3.4.0",
+    "tqdm>=4.64.0",
+    "pillow>=9.0.0",
+    "torch",
+    "torchvision",
+]
+
+[[tool.uv.index]]
+name = "nightly-cu132"
+url = "https://download.pytorch.org/whl/nightly/cu132"
+explicit = true
