@@ -1,26 +1,31 @@
 """
-Memory-optimized training script for 15 GB VRAM.
+Memory-optimized training script for 15 GB VRAM — Windows-stable.
 
-Changes from original train.py:
-  - img_size=256 instead of 512 (4x fewer pixels → 4x less activation memory)
-  - base_channels=64, attn_res=(32,16,8) — no 64x64 attention
-  - time_dim=text_dim=256 (half of original)
-  - batch_size=2, grad_accum=8 → effective batch=16 with minimal peak VRAM
-  - text_enc_d_model=256, text_enc_layers=4 (smaller text encoder)
-  - EMA on CPU (model.py change) — saves ~model_size VRAM
-  - gradient checkpointing (model.py change) — saves ~40% activation memory
-  - torch.backends.cuda.matmul.allow_tf32 = True — faster matmul on Ampere+
-  - Empty CUDA cache before validation sampling
-  - autocast device_type inferred at runtime (works for CPU too)
-
-To train on a single 15 GB GPU:
+Windows crash fix (CachingHostAllocator / pinned memory race condition):
+  The crash in CachingHostAllocator.cpp is caused by three interacting issues
+  on Windows + Python 3.13:
+    1. pin_memory=True in DataLoader causes a race when worker processes free
+       pinned tensors while the main process GC is running.
+    2. num_workers > 0 on Windows uses spawn (not fork), which is slower and
+       more prone to allocator conflicts.
+    3. Python 3.13 changed GC timing, making the race more frequent.
+  Fixes applied:
+    - pin_memory=False (safest on Windows; small throughput cost)
+    - num_workers=0 (single-process loading, no race possible)
+    - persistent_workers=False (workers recreated each epoch, avoids stale state)
+    - multiprocessing_context="spawn" set explicitly where workers > 0
+    - torch.multiprocessing.set_sharing_strategy("file_system") on Windows
+    - Checkpoint saved at end of every epoch (crash recovery)
+ 
+To train:n1
     python train.py
 
-To resume:
-    python train.py --resume checkpoints/best_model.pth
+To resume after a crash:
+    python train.py --resume checkpoints/latest.pth
 """
 
 import os
+import sys
 import argparse
 import time
 import math
@@ -31,6 +36,12 @@ import torch.optim as optim
 from torch.amp import GradScaler, autocast
 import numpy as np
 from tqdm import tqdm
+
+# ---- Windows: fix pinned-memory allocator crash ----
+# On Windows, PyTorch's default "file_descriptor" sharing strategy conflicts
+# with pinned memory when workers are used. "file_system" avoids this.
+if sys.platform == "win32":
+    torch.multiprocessing.set_sharing_strategy("file_system")
 
 from dataset import get_dataloader, get_or_build_tokenizer, TextEncoder, MAX_SEQ_LEN
 from model import UNetDiffusion, EMA
@@ -82,7 +93,9 @@ def get_args():
     p.add_argument("--warmup_steps",  type=int,   default=2000)
     p.add_argument("--weight_decay",  type=float, default=1e-2)
     p.add_argument("--max_grad_norm", type=float, default=1.0)
-    p.add_argument("--num_workers",   type=int,   default=2)
+    p.add_argument("--num_workers",   type=int,   default=0,
+                   help="0 = single-process loading (safest on Windows). "
+                        "Set to 2-4 only on Linux.")
     p.add_argument("--amp",           action="store_true", default=True,
                    help="fp16 mixed precision — halves activation memory")
     p.add_argument("--ema_decay",     type=float, default=0.9999)
@@ -183,15 +196,39 @@ def train(args):
     os.makedirs(args.output_dir, exist_ok=True)
 
     # ---- Tokenizer + DataLoaders ----
+    # Windows fix: pin_memory=False and num_workers=0 prevent the
+    # CachingHostAllocator crash seen with Python 3.13 on Windows.
+    is_windows = sys.platform == "win32"
+    pin_memory  = not is_windows   # pinned memory unsafe on Windows
+    nw_val      = 0 if is_windows else min(args.num_workers, 1)
+
     tokenizer    = get_or_build_tokenizer(args.data_root)
-    train_loader = get_dataloader(
-        root=args.data_root, split="train", img_size=args.img_size,
-        batch_size=args.batch_size, num_workers=args.num_workers, tokenizer=tokenizer,
+    train_loader = torch.utils.data.DataLoader(
+        __import__("dataset").COCOTextDataset(
+            root=args.data_root, split="train",
+            img_size=args.img_size, tokenizer=tokenizer,
+        ),
+        batch_size=args.batch_size,
+        shuffle=True,
+        num_workers=args.num_workers,
+        pin_memory=pin_memory,
+        drop_last=True,
+        persistent_workers=False,          # avoids stale worker state on Windows
+        # spawn context required on Windows when num_workers > 0
+        multiprocessing_context="spawn" if (args.num_workers > 0 and is_windows) else None,
     )
-    val_loader = get_dataloader(
-        root=args.data_root, split="val", img_size=args.img_size,
-        batch_size=args.num_val_samples, num_workers=1, tokenizer=tokenizer,
-        max_samples=args.num_val_samples * 10, shuffle=False,
+    val_loader = torch.utils.data.DataLoader(
+        __import__("dataset").COCOTextDataset(
+            root=args.data_root, split="val",
+            img_size=args.img_size, tokenizer=tokenizer,
+            max_samples=args.num_val_samples * 10, aug=False,
+        ),
+        batch_size=args.num_val_samples,
+        shuffle=False,
+        num_workers=nw_val,
+        pin_memory=pin_memory,
+        drop_last=False,
+        persistent_workers=False,
     )
     print(f"Train  : {len(train_loader.dataset):,} | Val: {len(val_loader.dataset):,}")
 
@@ -274,8 +311,8 @@ def train(args):
 
         pbar = tqdm(train_loader, desc=f"Epoch {epoch}/{args.epochs}")
         for step_i, (images, token_ids, _) in enumerate(pbar):
-            images    = images.to(device, non_blocking=True)
-            token_ids = token_ids.to(device, non_blocking=True)
+            images    = images.to(device, non_blocking=pin_memory)
+            token_ids = token_ids.to(device, non_blocking=pin_memory)
 
             # --- Text encode under AMP ---
             with autocast(device.type, enabled=(args.amp and device.type == "cuda")):
@@ -330,6 +367,12 @@ def train(args):
 
         avg_loss = float(np.mean(epoch_losses))
         print(f"--- Epoch {epoch} | avg_loss={avg_loss:.4f} ---")
+
+        # Always save latest checkpoint for crash recovery
+        # (2 hours of training lost is painful — save every epoch)
+        _save(os.path.join(args.ckpt_dir, "latest.pth"),
+              epoch, global_step, model, text_encoder,
+              optimizer, ema, avg_loss, best_loss, args)
 
         # Save best
         if avg_loss < best_loss:
